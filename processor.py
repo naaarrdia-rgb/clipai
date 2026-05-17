@@ -4,7 +4,6 @@ import subprocess
 import re
 from pathlib import Path
 from typing import List, Dict, Tuple
-import yt_dlp
 import whisper
 import anthropic
 
@@ -15,39 +14,19 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 
 class VideoProcessor:
-    def __init__(self, url: str, num_clips: int = 3, clip_duration: int = 60, language: str = "fr"):
-        self.url = url
+    def __init__(self, video_path: str, num_clips: int = 3, clip_duration: int = 60, language: str = "fr"):
+        self.video_path = video_path
         self.num_clips = num_clips
         self.clip_duration = clip_duration
         self.language = language
         self.whisper_model = None
 
-    def download(self) -> Tuple[str, str]:
-        output_template = str(TEMP_DIR / "video.%(ext)s")
-        ydl_opts = {
-            "format": "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "outtmpl": output_template,
-            "merge_output_format": "mp4",
-"cookiefile": "cookies.txt",
-"quiet": True,
-                        "no_warnings": True,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(self.url, download=True)
-            title = info.get("title", "video")
-
-        for f in TEMP_DIR.glob("video.*"):
-            if f.suffix in [".mp4", ".mkv", ".webm"]:
-                return str(f), title
-
-        raise FileNotFoundError("Fichier vidéo introuvable après téléchargement.")
-
-    def transcribe(self, video_path: str) -> List[Dict]:
+    def transcribe(self) -> List[Dict]:
         if self.whisper_model is None:
             self.whisper_model = whisper.load_model("small")
 
         result = self.whisper_model.transcribe(
-            video_path,
+            self.video_path,
             language=self.language,
             word_timestamps=True,
             verbose=False
@@ -137,7 +116,7 @@ Réponds UNIQUEMENT en JSON valide, sans texte avant ou après :
             })
         return clips
 
-    def create_clips(self, video_path: str, clips_info: List[Dict], transcript: List[Dict]) -> List[str]:
+    def create_clips(self, clips_info: List[Dict], transcript: List[Dict]) -> List[str]:
         output_files = []
         for i, clip in enumerate(clips_info):
             start = clip["start"]
@@ -145,7 +124,7 @@ Réponds UNIQUEMENT en JSON valide, sans texte avant ou après :
             duration = end - start
 
             raw_clip = str(TEMP_DIR / f"raw_{i}.mp4")
-            self._ffmpeg_cut(video_path, raw_clip, start, duration)
+            self._ffmpeg_cut(raw_clip, start, duration)
 
             srt_path = str(TEMP_DIR / f"sub_{i}.srt")
             self._generate_srt(transcript, start, end, srt_path)
@@ -158,11 +137,11 @@ Réponds UNIQUEMENT en JSON valide, sans texte avant ou après :
 
         return output_files
 
-    def _ffmpeg_cut(self, input_path: str, output_path: str, start: float, duration: float):
+    def _ffmpeg_cut(self, output_path: str, start: float, duration: float):
         cmd = [
             "ffmpeg", "-y",
             "-ss", str(start),
-            "-i", input_path,
+            "-i", self.video_path,
             "-t", str(duration),
             "-c:v", "libx264",
             "-c:a", "aac",
