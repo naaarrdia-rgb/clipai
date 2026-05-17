@@ -28,7 +28,8 @@ class VideoProcessor:
             "format": "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "outtmpl": output_template,
             "merge_output_format": "mp4",
-            "quiet": True,
+            "cookiefile": "cookies.txt",
+             quiet": True,
             "no_warnings": True,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
