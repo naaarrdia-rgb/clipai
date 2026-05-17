@@ -1,126 +1,218 @@
-import streamlit as st
 import os
 import json
-import re
 import subprocess
-import tempfile
+import re
 from pathlib import Path
+from typing import List, Dict, Tuple
+import whisper
+import anthropic
 
-st.set_page_config(
-    page_title="ClipAI - Clips Viraux",
-    page_icon="🎬",
-    layout="centered"
-)
-
-st.markdown("""
-<style>
-.big-title { font-size: 2rem; font-weight: 700; margin-bottom: 0; }
-.sub { color: #888; margin-top: 0; margin-bottom: 1.5rem; }
-.clip-box { border: 1px solid #333; border-radius: 12px; padding: 1rem; margin: 0.5rem 0; }
-.score { background: #1DB954; color: white; padding: 2px 10px; border-radius: 20px; font-size: 0.8rem; }
-</style>
-""", unsafe_allow_html=True)
-
-st.markdown('<p class="big-title">🎬 ClipAI</p>', unsafe_allow_html=True)
-st.markdown('<p class="sub">Colle un lien YouTube → reçois des clips TikTok viraux en 9:16 avec sous-titres</p>', unsafe_allow_html=True)
-
-OUTPUT_DIR = Path("outputs")
 TEMP_DIR = Path("temp")
-OUTPUT_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR = Path("outputs")
 TEMP_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
 
-with st.sidebar:
-    st.header("⚙️ Paramètres")
-    api_key = st.text_input("Clé API Claude (Anthropic)", type="password", placeholder="sk-ant-...")
-    if api_key:
-        os.environ["ANTHROPIC_API_KEY"] = api_key
-    st.divider()
-    num_clips = st.slider("Nombre de clips", 1, 5, 3)
-    clip_duration = st.slider("Durée max (secondes)", 30, 90, 60)
-    language = st.selectbox("Langue de la vidéo", ["fr", "en", "ar", "es"], index=0)
-    st.divider()
-    if st.button("🗑️ Nettoyer les fichiers"):
-        import shutil
-        shutil.rmtree("outputs", ignore_errors=True)
-        shutil.rmtree("temp", ignore_errors=True)
-        OUTPUT_DIR.mkdir(exist_ok=True)
-        TEMP_DIR.mkdir(exist_ok=True)
-        st.success("Nettoyé !")
 
-url = st.text_input("🔗 Lien YouTube", placeholder="https://www.youtube.com/watch?v=...")
+class VideoProcessor:
+    def __init__(self, video_path: str, num_clips: int = 3, clip_duration: int = 60, language: str = "fr"):
+        self.video_path = video_path
+        self.num_clips = num_clips
+        self.clip_duration = clip_duration
+        self.language = language
+        self.whisper_model = None
 
-col1, col2 = st.columns([3,1])
-with col1:
-    go = st.button("🚀 Générer mes clips", type="primary", use_container_width=True)
+    def transcribe(self) -> List[Dict]:
+        if self.whisper_model is None:
+            self.whisper_model = whisper.load_model("small")
 
-if go:
-    if not url or not url.startswith("http"):
-        st.error("❌ Colle un vrai lien YouTube !")
-        st.stop()
+        result = self.whisper_model.transcribe(
+            self.video_path,
+            language=self.language,
+            word_timestamps=True,
+            verbose=False
+        )
 
-    from processor import VideoProcessor
-    processor = VideoProcessor(url, num_clips, clip_duration, language)
+        segments = []
+        for seg in result["segments"]:
+            segments.append({
+                "start": seg["start"],
+                "end": seg["end"],
+                "text": seg["text"].strip()
+            })
+        return segments
 
-    with st.status("⏳ Traitement en cours...", expanded=True) as status:
+    def detect_viral_moments(self, transcript: List[Dict]) -> List[Dict]:
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            return self._fallback_segments(transcript)
 
-        st.write("📥 Téléchargement de la vidéo YouTube...")
-        try:
-            video_path, title = processor.download()
-            st.write(f"✅ **{title}**")
-        except Exception as e:
-            st.error(f"❌ Erreur téléchargement : {e}")
-            st.stop()
+        formatted = "\n".join(
+            [f"[{s['start']:.1f}s - {s['end']:.1f}s] {s['text']}" for s in transcript]
+        )
 
-        st.write("🎤 Transcription audio avec Whisper...")
-        try:
-            transcript = processor.transcribe(video_path)
-            st.write(f"✅ {len(transcript)} segments transcrits")
-        except Exception as e:
-            st.error(f"❌ Erreur transcription : {e}")
-            st.stop()
+        client = anthropic.Anthropic(api_key=api_key)
+        prompt = f"""Tu es un expert en contenu viral TikTok et YouTube Shorts.
 
-        st.write("🤖 Détection des moments viraux par l'IA...")
-        try:
-            clips_info = processor.detect_viral_moments(transcript)
-            st.write(f"✅ {len(clips_info)} moments sélectionnés")
-        except Exception as e:
-            st.error(f"❌ Erreur IA : {e}")
-            st.stop()
+Voici la transcription d'une vidéo avec timestamps :
 
-        st.write("✂️ Création des clips en format 9:16 + sous-titres...")
-        try:
-            output_files = processor.create_clips(video_path, clips_info, transcript)
-            st.write(f"✅ {len(output_files)} clips prêts !")
-        except Exception as e:
-            st.error(f"❌ Erreur montage : {e}")
-            st.stop()
+{formatted}
 
-        status.update(label="✅ Clips prêts à télécharger !", state="complete")
+Identifie exactement {self.num_clips} moments viraux pour TikTok.
+Critères : émotion forte, conseil pratique, surprise, humour, révélation, tension.
+Chaque clip doit durer entre 20 et {self.clip_duration} secondes.
 
-    st.success(f"🎉 {len(output_files)} clips générés !")
-    st.divider()
-    st.subheader("📥 Télécharge tes clips")
+Réponds UNIQUEMENT en JSON valide, sans texte avant ou après :
+[
+  {{
+    "title": "Titre accrocheur du clip",
+    "start": 12.5,
+    "end": 67.0,
+    "viral_score": 9,
+    "reason": "Pourquoi ce moment est viral",
+    "description": "Description prête à poster sur TikTok (2-3 phrases accrocheuses)",
+    "hashtags": "#viral #tiktok #fyp (8-10 hashtags pertinents)"
+  }}
+]"""
 
-    for i, (clip_path, info) in enumerate(zip(output_files, clips_info)):
-        with st.container():
-            c1, c2 = st.columns([4,1])
-            with c1:
-                st.markdown(f"**Clip {i+1}** — {info.get('title','Moment viral')}")
-                st.caption(f"⏱️ {info.get('start',0):.0f}s → {info.get('end',0):.0f}s | {info.get('reason','')}")
-                st.caption(f"📝 {info.get('description','')}")
-                st.caption(f"#️⃣ {info.get('hashtags','')}")
-            with c2:
-                score = info.get('viral_score', 8)
-                st.markdown(f'<span class="score">🔥 {score}/10</span>', unsafe_allow_html=True)
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1500,
+            messages=[{"role": "user", "content": prompt}]
+        )
 
-            if os.path.exists(clip_path):
-                st.video(clip_path)
-                with open(clip_path, "rb") as f:
-                    st.download_button(
-                        f"⬇️ Télécharger clip {i+1}",
-                        f,
-                        file_name=f"clip_{i+1}.mp4",
-                        mime="video/mp4",
-                        use_container_width=True
-                    )
-            st.divider()
+        raw = message.content[0].text.strip()
+        raw = re.sub(r"```json|```", "", raw).strip()
+        clips = json.loads(raw)
+
+        video_end = transcript[-1]["end"] if transcript else 0
+        valid_clips = []
+        for c in clips[:self.num_clips]:
+            start = max(0, float(c.get("start", 0)))
+            end = min(video_end, float(c.get("end", start + self.clip_duration)))
+            if end - start >= 10:
+                c["start"] = start
+                c["end"] = end
+                valid_clips.append(c)
+
+        return valid_clips
+
+    def _fallback_segments(self, transcript: List[Dict]) -> List[Dict]:
+        if not transcript:
+            return []
+        total = transcript[-1]["end"]
+        step = total / (self.num_clips + 1)
+        clips = []
+        for i in range(self.num_clips):
+            start = step * i
+            end = min(start + self.clip_duration, total)
+            clips.append({
+                "title": f"Moment {i+1}",
+                "start": start,
+                "end": end,
+                "viral_score": 7,
+                "reason": "Sélection automatique (sans clé API)",
+                "description": "Contenu extrait automatiquement.",
+                "hashtags": "#viral #tiktok #fyp #shorts"
+            })
+        return clips
+
+    def create_clips(self, clips_info: List[Dict], transcript: List[Dict]) -> List[str]:
+        output_files = []
+        for i, clip in enumerate(clips_info):
+            start = clip["start"]
+            end = clip["end"]
+            duration = end - start
+
+            raw_clip = str(TEMP_DIR / f"raw_{i}.mp4")
+            self._ffmpeg_cut(raw_clip, start, duration)
+
+            srt_path = str(TEMP_DIR / f"sub_{i}.srt")
+            self._generate_srt(transcript, start, end, srt_path)
+
+            output_path = str(OUTPUT_DIR / f"clip_{i+1}.mp4")
+            self._ffmpeg_final(raw_clip, srt_path, output_path)
+
+            if os.path.exists(output_path):
+                output_files.append(output_path)
+
+        return output_files
+
+    def _ffmpeg_cut(self, output_path: str, start: float, duration: float):
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start),
+            "-i", self.video_path,
+            "-t", str(duration),
+            "-c:v", "libx264",
+            "-c:a", "aac",
+            "-preset", "fast",
+            "-crf", "23",
+            output_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"FFmpeg cut error: {result.stderr[-300:]}")
+
+    def _generate_srt(self, transcript: List[Dict], clip_start: float, clip_end: float, srt_path: str):
+        def to_srt_time(seconds: float) -> str:
+            h = int(seconds // 3600)
+            m = int((seconds % 3600) // 60)
+            s = int(seconds % 60)
+            ms = int((seconds - int(seconds)) * 1000)
+            return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+        entries = []
+        idx = 1
+        for seg in transcript:
+            seg_start = max(seg["start"], clip_start)
+            seg_end = min(seg["end"], clip_end)
+            if seg_end <= seg_start:
+                continue
+            rel_start = seg_start - clip_start
+            rel_end = seg_end - clip_start
+            text = seg["text"].strip()
+            if not text:
+                continue
+            words = text.split()
+            lines = []
+            for j in range(0, len(words), 6):
+                lines.append(" ".join(words[j:j+6]))
+            entries.append(
+                f"{idx}\n{to_srt_time(rel_start)} --> {to_srt_time(rel_end)}\n{chr(10).join(lines)}\n"
+            )
+            idx += 1
+
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(entries))
+
+    def _ffmpeg_final(self, input_path: str, srt_path: str, output_path: str):
+        srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:")
+        vf = (
+            "scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920,"
+            f"subtitles={srt_escaped}:force_style='"
+            "FontName=Arial,"
+            "FontSize=16,"
+            "PrimaryColour=&H00FFFFFF,"
+            "OutlineColour=&H00000000,"
+            "BorderStyle=3,"
+            "Outline=2,"
+            "Shadow=1,"
+            "Alignment=2,"
+            "MarginV=60"
+            "'"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", input_path,
+            "-vf", vf,
+            "-c:v", "libx264",
+            "-c:a", "aac",
+            "-preset", "fast",
+            "-crf", "23",
+            "-movflags", "+faststart",
+            output_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"FFmpeg final error: {result.stderr[-300:]}")
